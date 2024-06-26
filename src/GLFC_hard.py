@@ -7,10 +7,12 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from torch.autograd import Variable
 import torch.optim as optim
-from myNetwork import *
+from myNetwork_hard import *
 from iCIFAR100 import iCIFAR100
 from torch.utils.data import DataLoader
 import random
+import dataloaders
+from utils.schedulers import CosineSchedule
 from Fed_utils import * 
 
 def get_one_hot(target, num_class, device):
@@ -24,25 +26,33 @@ def entropy(input_):
     entropy = torch.sum(entropy, dim=1)
     return entropy
 
-class GLFC_model:
+class GLFC_model_hard:
 
-    def __init__(self, numclass, feature_extractor, batch_size, task_size, memory_size, epochs, learning_rate, train_set, device, encode_model):
+    def __init__(self, numclass, feature_extractor, batch_size, task_size, memory_size, epochs, learning_rate, train_set, device, encode_model, dataset):
 
-        super(GLFC_model, self).__init__()
+        super(GLFC_model_hard, self).__init__()
+        self.numclass = numclass
         self.epochs = epochs
         self.learning_rate = learning_rate
-        self.model = network(numclass, feature_extractor)
+        # self.model = network(numclass, feature_extractor)
+        self.model = None
         self.encode_model = encode_model
+        self.dataset = dataset
 
 
         self.exemplar_set = []
         self.class_mean_set = []
-        self.numclass = 0
+        # self.numclass = 0
         self.learned_numclass = 0
         self.learned_classes = []
-        self.transform = transforms.Compose([#transforms.Resize(img_size),
+        if dataset == "MNIST":
+            self.transform = transforms.Compose([#transforms.Resize(img_size),
                                              transforms.ToTensor(),
                                             transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))])
+        else:
+            self.transform = dataloaders.utils.get_transform(dataset=dataset, phase='train', aug=True, resize_imnet=True)
+            print(f"self.transform: {self.transform}")        
+            
         self.old_model = None
         self.train_dataset = train_set
         self.start = True
@@ -58,28 +68,62 @@ class GLFC_model:
         self.task_id_old = -1
         self.device = device
         self.last_entropy = 0
+        
+        self.last_class_real = None
+        self.last_class_proportion = None
+        self.real_task_id = -1
+        self.client_learned_global_task_id = []
 
     # get incremental train data
-    def beforeTrain(self, task_id_new, group):
+    def beforeTrain(self, task_id_new, group, client_index, global_task_id_real, class_real=None):
+        self.signal = False
+        
         if task_id_new != self.task_id_old:
             self.task_id_old = task_id_new
-            self.numclass = self.task_size * (task_id_new + 1)
             if group != 0:
+                self.signal = True
                 if self.current_class != None:
                     self.last_class = self.current_class
-                self.current_class = random.sample([x for x in range(self.numclass - self.task_size, self.numclass)], 6)
-                # print(self.current_class)
+                    self.last_class_proportion = self.current_class_proportion
+                    self.last_class_real = self.current_class_real
+                self.current_class = self.model.class_distribution[client_index][task_id_new]
+                #TODO:same task
+                classes_list = []
+                for i in self.current_class:
+                    classes_list.append(class_real[i])
+
+                self.current_class = classes_list
+                self.current_class_real = self.model.class_distribution_real[client_index][task_id_new]
+                self.current_class_proportion = self.model.class_distribution_proportion[client_index][task_id_new]
+                self.real_task_id = task_id_new            
+                print(f"self.current_class: {self.current_class}\nself.current_class_real: {self.current_class_real}\nself.current_class_proportion: {self.current_class_proportion}")
+                print(f"self.real_task_id: {self.real_task_id}")
+                
+                self.client_learned_global_task_id.append(global_task_id_real[self.model.args.num_clients * task_id_new + client_index])
+                print(f"self.client_learned_global_task_id: {self.client_learned_global_task_id}")
             else:
                 self.last_class = None
+                self.last_class_real = None
+                self.last_class_proportion = None
+        
+            # self.numclass = self.task_size * (task_id_new + 1)
+            # if group != 0:
+            #     if self.current_class != None:
+            #         self.last_class = self.current_class
+            #     self.current_class = random.sample([x for x in range(self.numclass - self.task_size, self.numclass)], 6)
+            #     # print(self.current_class)
+            # else:
+            #     self.last_class = None
 
-        self.train_loader = self._get_train_and_test_dataloader(self.current_class, False)
+        # self.train_loader = self._get_train_and_test_dataloader(self.current_class, False)
+        self.train_loader = self._get_train_and_test_dataloader(self.current_class, self.current_class_real, self.current_class_proportion, False)
         print(f"beforeTrain, current_class: {self.current_class}, learned_classes: {self.learned_classes}, task_id_new: {task_id_new}, group: {group}\nlen(self.train_loader): {len(self.train_loader)}, self.last_class: {self.last_class}")
         
-    def update_new_set(self):
+    def update_new_set(self, task_id, client_index):
         self.model = model_to_device(self.model, False, self.device)
         self.model.eval()
-        self.signal = False
-        self.signal = self.entropy_signal(self.train_loader)
+        # self.signal = False
+        # self.signal = self.entropy_signal(self.train_loader)
 
         if self.signal and (self.last_class != None):
             self.learned_numclass += len(self.last_class)
@@ -88,20 +132,29 @@ class GLFC_model:
             m = int(self.memory_size / self.learned_numclass)
             self._reduce_exemplar_sets(m)
             for i in self.last_class: 
-                images = self.train_dataset.get_image_class(i)
+                images = self.train_dataset.get_image_class(self.last_class_real[self.last_class.index(i)], self.model.client_index, self.last_class_proportion)
+                # images = self.train_dataset.get_image_class(i)
                 self._construct_exemplar_set(images, m)
 
         self.model.train()
-
-        self.train_loader = self._get_train_and_test_dataloader(self.current_class, True)
+        self.model.set_learned_unlearned_class(sorted(list(set(self.current_class + self.learned_classes))))
+        self.model.current_class = self.current_class
+        
+        if "notran" in self.model.args.method:
+            self.train_loader = self._get_train_and_test_dataloader(self.current_class, self.current_class_real, self.current_class_proportion, False)
+        else:
+            self.train_loader = self._get_train_and_test_dataloader(self.current_class, self.current_class_real, self.current_class_proportion, True)
+        # self.train_loader = self._get_train_and_test_dataloader(self.current_class, True)
         print(f"update_new_set, current_class: {self.current_class}, learned_classes: {self.learned_classes}\nlen(self.train_loader): {len(self.train_loader)}")
 
 
-    def _get_train_and_test_dataloader(self, train_classes, mix):
+    def _get_train_and_test_dataloader(self, train_classes, train_classes_real, train_classes_proportion,  mix):
         if mix:
-            self.train_dataset.getTrainData(train_classes, self.exemplar_set, self.learned_classes)
+            self.train_dataset.getTrainData(train_classes, self.exemplar_set, self.learned_classes, self.model.client_index, classes_real=train_classes_real, classes_proportion=train_classes_proportion, exe_class=self.learned_classes)
+            # self.train_dataset.getTrainData(train_classes, self.exemplar_set, self.learned_classes)
         else:
-            self.train_dataset.getTrainData(train_classes, [], [])
+            self.train_dataset.getTrainData(train_classes, [], [], self.model.client_index, classes_real=train_classes_real, classes_proportion=train_classes_proportion)
+            # self.train_dataset.getTrainData(train_classes, [], [])
 
         train_loader = DataLoader(dataset=self.train_dataset,
                                   shuffle=True,
@@ -114,7 +167,17 @@ class GLFC_model:
     # train model
     def train(self, ep_g, model_old):
         self.model = model_to_device(self.model, False, self.device)
-        opt = optim.SGD(self.model.parameters(), lr=self.learning_rate, weight_decay=0.00001)
+        self.model.ep_g = ep_g
+        #opt = optim.SGD(self.model.fc.parameters(), lr=self.learning_rate, weight_decay=0.00001) #因为换成了VIT，所以只优化FC
+        # opt = optim.SGD(self.model.parameters(), lr=self.learning_rate, weight_decay=0.00001)
+        # TODO: 'sharedfc', 'sharedencoder', 'sharedprompt', 'sharedcodap' in self.model.args.method to be implemented
+        if isinstance(self.device, int):
+            opt = torch.optim.Adam(list(self.model.fc.parameters())+list([self.model.aggregate_weight] + list(self.model.client_fc.parameters())), lr=self.learning_rate,
+                                                weight_decay=0, betas=(0.9, 0.999))
+        else:
+            opt = torch.optim.Adam(self.model.module.fc.parameters()+list([self.model.module.aggregate_weight] + list(self.model.module.client_fc.parameters())), lr=self.learning_rate,
+                                                weight_decay=0, betas=(0.9, 0.999))
+        scheduler = CosineSchedule(opt, K=self.epochs)
 
         if model_old[1] != None:
             if self.signal:
@@ -132,84 +195,117 @@ class GLFC_model:
         
         for epoch in range(self.epochs):
             loss_cur_sum, loss_mmd_sum = [], []
-            if (epoch + ep_g * 20) % 200 == 100:
-                if self.numclass==self.task_size:
-                     opt = optim.SGD(self.model.parameters(), lr=self.learning_rate / 5, weight_decay=0.00001)
-                else:
-                     for p in opt.param_groups:
-                         p['lr'] =self.learning_rate / 5
-            elif (epoch + ep_g * 20) % 200 == 150:
-                if self.numclass>self.task_size:
-                     for p in opt.param_groups:
-                         p['lr'] =self.learning_rate / 25
-                else:
-                     opt = optim.SGD(self.model.parameters(), lr=self.learning_rate / 25, weight_decay=0.00001)
-            elif (epoch + ep_g * 20) % 200 == 180:
-                if self.numclass==self.task_size:
-                    opt = optim.SGD(self.model.parameters(), lr=self.learning_rate / 125,weight_decay=0.00001)
-                else:
-                    for p in opt.param_groups:
-                        p['lr'] =self.learning_rate / 125
+            # if (epoch + ep_g * 20) % 200 == 100:
+            #     if self.numclass==self.task_size:
+            #          opt = optim.SGD(self.model.parameters(), lr=self.learning_rate / 5, weight_decay=0.00001)
+            #     else:
+            #          for p in opt.param_groups:
+            #              p['lr'] =self.learning_rate / 5
+            # elif (epoch + ep_g * 20) % 200 == 150:
+            #     if self.numclass>self.task_size:
+            #          for p in opt.param_groups:
+            #              p['lr'] =self.learning_rate / 25
+            #     else:
+            #          opt = optim.SGD(self.model.parameters(), lr=self.learning_rate / 25, weight_decay=0.00001)
+            # elif (epoch + ep_g * 20) % 200 == 180:
+            #     if self.numclass==self.task_size:
+            #         opt = optim.SGD(self.model.parameters(), lr=self.learning_rate / 125,weight_decay=0.00001)
+            #     else:
+            #         for p in opt.param_groups:
+            #             p['lr'] =self.learning_rate / 125
+            if epoch > 0:
+                scheduler.step()
             for step, (indexs, images, target) in enumerate(self.train_loader):
                 images, target = images.cuda(self.device), target.cuda(self.device)
-                loss_value = self._compute_loss(indexs, images, target)
+                # print(f"images.shape: {images.shape}")    # torch.Size([16, 3, 224, 224])
+                loss_value, loss_cur, loss_old = self._compute_loss(indexs, images, target)
+                if step % 2 == 0 and epoch % 2 == 0:
+                    print('{}/{} {}/{} {} {} {}'.format(step, len(self.train_loader), epoch, self.epochs, loss_value, loss_cur, loss_old))
                 opt.zero_grad()
                 loss_value.backward()
                 opt.step()
+        return len(self.train_loader)
 
     def entropy_signal(self, loader):
-        self.model.eval()
-        start_ent = True
-        res = False
+        return True
+        # self.model.eval()
+        # start_ent = True
+        # res = False
 
-        for step, (indexs, imgs, labels) in enumerate(loader):
-            imgs, labels = imgs.cuda(self.device), labels.cuda(self.device)
-            with torch.no_grad():
-                outputs = self.model(imgs)
-            softmax_out = nn.Softmax(dim=1)(outputs)
-            ent = entropy(softmax_out)
+        # for step, (indexs, imgs, labels) in enumerate(loader):
+        #     imgs, labels = imgs.cuda(self.device), labels.cuda(self.device)
+        #     with torch.no_grad():
+        #         outputs = self.model(imgs)
+        #     softmax_out = nn.Softmax(dim=1)(outputs)
+        #     ent = entropy(softmax_out)
 
-            if start_ent:
-                all_ent = ent.float().cpu()
-                all_label = labels.long().cpu()
-                start_ent = False
-            else:
-                all_ent = torch.cat((all_ent, ent.float().cpu()), 0)
-                all_label = torch.cat((all_label, labels.long().cpu()), 0)
+        #     if start_ent:
+        #         all_ent = ent.float().cpu()
+        #         all_label = labels.long().cpu()
+        #         start_ent = False
+        #     else:
+        #         all_ent = torch.cat((all_ent, ent.float().cpu()), 0)
+        #         all_label = torch.cat((all_label, labels.long().cpu()), 0)
 
-        overall_avg = torch.mean(all_ent).item()
-        # print(overall_avg)
-        print(f"overall_avg: {overall_avg}, last_entropy: {self.last_entropy}, {overall_avg - self.last_entropy}")
-        if overall_avg - self.last_entropy > 1.2:
-            res = True
+        # overall_avg = torch.mean(all_ent).item()
+        # # print(overall_avg)
+        # print(f"overall_avg: {overall_avg}, last_entropy: {self.last_entropy}, {overall_avg - self.last_entropy}")
+        # if overall_avg - self.last_entropy > 1.2:
+        #     res = True
         
-        self.last_entropy = overall_avg
+        # self.last_entropy = overall_avg
 
-        self.model.train()
+        # self.model.train()
 
-        return res
+        # return res
 
     def _compute_loss(self, indexs, imgs, label):
-        output = self.model(imgs)
+        output_ori = self.model(imgs)
+        output = torch.sigmoid(output_ori)
+        # output = self.model(imgs)
 
         target = get_one_hot(label, self.numclass, self.device)
         output, target = output.cuda(self.device), target.cuda(self.device)
         if self.old_model == None:
-            w = self.efficient_old_class_weight(output, label)
-            loss_cur = torch.mean(w * F.binary_cross_entropy_with_logits(output, target, reduction='none'))
+            # w = self.efficient_old_class_weight(output, label)
+            if "weit" in self.model.args.method:
+                loss_cur = torch.mean(nn.CrossEntropyLoss()(output_ori, label))
+            else:
+                loss_cur = torch.mean(F.binary_cross_entropy(output, target, reduction='none'))
+                # loss_cur = torch.mean(w * F.binary_cross_entropy_with_logits(output, target, reduction='none'))
 
-            return loss_cur
+            return loss_cur, 0, 0
         else:
-            w = self.efficient_old_class_weight(output, label)
-            loss_cur = torch.mean(w * F.binary_cross_entropy_with_logits(output, target, reduction='none'))
+            if "fcil_imagenet" in self.model.args.method or "fcil_domainnet" in self.model.args.method:
+                # w = self.efficient_old_class_weight(output, label)
+                loss_cur = torch.mean(F.binary_cross_entropy(output, target, reduction='none'))
+                distill_target = target.clone()
+                old_target = torch.sigmoid(self.old_model(imgs))
+                old_target[:, sorted(list(set(list(range(self.model.numclass))) - set(self.learned_classes)))] = -float('inf')
+                old_target = torch.sigmoid(old_target)
+                old_target_clone = old_target.clone()
+                old_target_clone[..., self.current_class] = distill_target[..., self.current_class]
+                loss_old = F.binary_cross_entropy(output, old_target_clone.detach())
+                loss_proxi = 0
+            elif "notran" in self.model.args.method:
+                if "weit" in self.model.args.method:
+                    loss_cur = torch.mean(nn.CrossEntropyLoss()(output_ori, label))
+                    #loss_cur = torch.mean(F.binary_cross_entropy(output, target, reduction='none'))
+                else:
+                    loss_cur = torch.mean(F.binary_cross_entropy(output, target, reduction='none'))
+                loss_old = 0
+                loss_proxi = 0
+            elif "weit" in self.model.args.method:
+                loss_cur = torch.mean(nn.CrossEntropyLoss()(output_ori, label))
+                loss_old = 0
+                loss_proxi = 0
+            
+            return loss_cur + loss_old + loss_proxi, loss_cur, loss_old
+            # old_task_size = old_target.shape[1]
+            # distill_target[..., :old_task_size] = old_target
+            # loss_old = F.binary_cross_entropy_with_logits(output, distill_target)
 
-            distill_target = target.clone()
-            old_target = torch.sigmoid(self.old_model(imgs))
-            old_task_size = old_target.shape[1]
-            distill_target[..., :old_task_size] = old_target
-            loss_old = F.binary_cross_entropy_with_logits(output, distill_target)
-
-            return 0.5 * loss_cur + 0.5 * loss_old
+            # return 0.5 * loss_cur + 0.5 * loss_old
 
     def efficient_old_class_weight(self, output, label):
         pred = torch.sigmoid(output)
@@ -250,7 +346,7 @@ class GLFC_model:
     def _construct_exemplar_set(self, images, m):
         class_mean, feature_extractor_output = self.compute_class_mean(images, self.transform)
         exemplar = []
-        now_class_mean = np.zeros((1, 512))
+        now_class_mean = np.zeros((1, 768))
      
         for i in range(m):
             x = class_mean - (now_class_mean + feature_extractor_output) / (i + 1)
@@ -267,9 +363,16 @@ class GLFC_model:
             self.exemplar_set[index] = self.exemplar_set[index][:m]
 
     def Image_transform(self, images, transform):
-        data = transform(Image.fromarray(images[0])).unsqueeze(0)
+        if self.dataset == "ImageNet_R":
+            data = transform(Image.fromarray(jpg_image_to_array(images[0]))).unsqueeze(0)
+        else:  
+            data = transform(Image.fromarray(images[0])).unsqueeze(0)
+        # data = transform(Image.fromarray(images[0])).unsqueeze(0)
         for index in range(1, len(images)):
-            data = torch.cat((data, self.transform(Image.fromarray(images[index])).unsqueeze(0)), dim=0)
+            if self.dataset == 'ImageNet_R':
+                data = torch.cat((data, self.transform(Image.fromarray(jpg_image_to_array(images[0]))).unsqueeze(0)), dim=0)
+            else:
+                data = torch.cat((data, self.transform(Image.fromarray(images[index])).unsqueeze(0)), dim=0)
         return data
 
     def compute_class_mean(self, images, transform):
@@ -343,3 +446,14 @@ class GLFC_model:
             proto_grad.append(original_dy_dx)
 
         return proto_grad
+
+def jpg_image_to_array(image_path):
+    """
+    Loads JPEG image into 3D Numpy array of shape 
+    (width, height, channels)
+    """
+    with Image.open(image_path) as image:      
+        image = image.convert('RGB')
+        im_arr = np.fromstring(image.tobytes(), dtype=np.uint8)
+        im_arr = im_arr.reshape((image.size[1], image.size[0], 3))                                   
+    return im_arr
